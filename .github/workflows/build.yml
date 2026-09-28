@@ -1,0 +1,339 @@
+name: MysticGSI Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_name:
+        description: 'Name for the build (out/<name>/)'
+        required: true
+        default: 'devicename-gsi'
+      firmware_url:
+        description: 'Firmware URL (Google Drive, Mega.nz, or direct link)'
+        required: true
+        default: ''
+      rom_type:
+        description: 'ROM patch set (--type), leave empty for generic'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune -a -f || true
+          df -h
+
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+
+      - name: Debug - list checkout contents
+        run: |
+          pwd
+          ls -la
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3 python3-venv erofs-utils aria2 patch \
+            default-jre-headless curl build-essential cmake ninja-build pkg-config \
+            perl golang-go libgtest-dev libusb-1.0-0-dev libpcre2-dev \
+            libprotobuf-dev protobuf-compiler libbrotli-dev liblz4-dev libzstd-dev \
+            libarchive-tools openssl file p7zip-full unrar-free xz-utils
+
+      - name: Install apktool
+        run: |
+          mkdir -p ~/.local/bin
+          ver=$(curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest \
+            | grep -oP '"tag_name": "v\K[^"]+')
+          curl -fL -o ~/.local/bin/apktool.jar \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v${ver}/apktool_${ver}.jar"
+          printf '#!/bin/sh\nexec java -jar "$HOME/.local/bin/apktool.jar" "$@"\n' \
+            > ~/.local/bin/apktool
+          chmod +x ~/.local/bin/apktool
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run setup
+        run: |
+          chmod +x setup_host.py
+          python3 setup_host.py
+
+      # ---------------------------------------------------------------------------
+      # Download — preserve original filename so extension-based detection works.
+      # Google Drive / Mega keep their server-side names automatically.
+      # Direct links: aria2c without -o to preserve the URL filename.
+      # ---------------------------------------------------------------------------
+      - name: Download firmware
+        run: |
+          URL="${{ github.event.inputs.firmware_url }}"
+          mkdir -p dl
+          echo "URL: $URL"
+          case "$URL" in
+            *drive.google.com*)
+              echo "Source: Google Drive"
+              .venv/bin/python -m pip install -q gdown
+              mkdir -p ~/.cache/gdown
+              if [ -n "${{ secrets.GDRIVE_COOKIES }}" ]; then
+                echo "${{ secrets.GDRIVE_COOKIES }}" > ~/.cache/gdown/cookies.txt
+              fi
+              .venv/bin/python -m gdown --fuzzy "$URL" -O dl/
+              ;;
+            *mega.nz*|*mega.co.nz*)
+              echo "Source: Mega.nz"
+              sudo apt-get install -y megatools
+              megadl --path dl/ "$URL"
+              ;;
+            *)
+              echo "Source: direct link"
+              # No -o: preserves the server filename (.kdz, .ozip, .pac, etc.)
+              aria2c -d dl -x4 -s4 "$URL"
+              ;;
+          esac
+          echo "Downloaded:"
+          find dl -maxdepth 1 -type f -exec ls -lh {} \;
+
+      # ---------------------------------------------------------------------------
+      # Locate firmware file for cli.py.
+      #
+      # Supported by MysticGSI (passed straight through):
+      #   Huawei UPDATE.APP · LG .kdz · Oppo .ozip · Sony .sin
+      #   Samsung .tar / .tar.md5 · Unisoc .pac · QFIL dir (rawprogram*.xml)
+      #   OTA zip (payload.bin inside) · super*.img · system.new.dat dir · *.img
+      #
+      # Strategy:
+      #   1. If the downloaded file is already a directly-consumable firmware
+      #      format, use it as-is (avoids unnecessary extraction).
+      #   2. Otherwise extract the outer archive and scan the contents.
+      #   3. If no firmware is found after one extraction level, look for a
+      #      nested zip (e.g. Pixel factory image-*.zip) and scan again.
+      # ---------------------------------------------------------------------------
+      - name: Locate firmware file for CLI
+        run: |
+          DL_FILE=$(find dl -maxdepth 1 -type f | head -n1)
+          if [ -z "$DL_FILE" ]; then
+            echo "ERROR: no file in dl/"
+            exit 1
+          fi
+          echo "Downloaded file: $DL_FILE"
+
+          MIME=$(file -b --mime-type "$DL_FILE")
+          echo "MIME: $MIME"
+
+          # ---- helpers -------------------------------------------------------
+
+          extract_archive() {
+            local src="$1" dst="$2"
+            mkdir -p "$dst"
+            local m
+            m=$(file -b --mime-type "$src")
+            case "$m" in
+              # JAR / APK / OTA zips all share the ZIP format; `file` often
+              # returns application/java-archive for Android OTA packages.
+              application/zip|\
+              application/java-archive|\
+              application/x-zip-compressed|\
+              application/x-zip)
+                unzip -o "$src" -d "$dst" ;;
+              application/x-7z-compressed)
+                7z x "$src" -o"$dst" ;;
+              application/x-rar*|application/vnd.rar)
+                if command -v unrar >/dev/null 2>&1; then
+                  unrar x -o+ "$src" "$dst"/
+                else
+                  unrar-free x "$src" "$dst"/ 2>/dev/null \
+                    || 7z x "$src" -o"$dst"
+                fi ;;
+              application/x-tar|application/gzip|\
+              application/x-bzip2|application/x-xz)
+                tar -xf "$src" -C "$dst" ;;
+              *)
+                # Extension-based second guess (MIME may be generic octet-stream)
+                case "${src##*.}" in
+                  zip|apk|jar) unzip -o "$src" -d "$dst" ;;
+                  7z)          7z x "$src" -o"$dst" ;;
+                  rar)         unrar x -o+ "$src" "$dst"/ 2>/dev/null \
+                                 || 7z x "$src" -o"$dst" ;;
+                  tar|tgz|gz|bz2|xz) tar -xf "$src" -C "$dst" ;;
+                  *)
+                    # Last resort: test zip magic regardless of label
+                    if unzip -t "$src" >/dev/null 2>&1; then
+                      unzip -o "$src" -d "$dst"
+                    else
+                      cp "$src" "$dst/"
+                    fi ;;
+                esac ;;
+            esac
+          }
+
+          # Sets DETECTED_FILE and DETECTED_TYPE (globals, same shell)
+          detect_in_dir() {
+            local D="$1"
+            DETECTED_FILE=""
+            DETECTED_TYPE=""
+            NESTED_ZIP=""
+
+            local HW KDZ OZIP SIN SAM_AP SAM_ANY PAC QFIL PAYLOAD SUPER SYSDAT IMG NZIP
+            HW=$(find "$D"       -iname 'UPDATE.APP'                              | head -n1)
+            KDZ=$(find "$D"      -iname '*.kdz'                                   | head -n1)
+            OZIP=$(find "$D"     -iname '*.ozip'                                  | head -n1)
+            SIN=$(find "$D"      -iname '*.sin'                                   | head -n1)
+            SAM_AP=$(find "$D" \( -iname 'AP_*.tar.md5' -o -iname 'AP_*.tar' \)  | head -n1)
+            SAM_ANY=$(find "$D" \( -iname '*.tar.md5'   -o -iname '*.tar'    \)  | head -n1)
+            PAC=$(find "$D"      -iname '*.pac'                                   | head -n1)
+            QFIL=$(find "$D"     -iname 'rawprogram*.xml'                         | head -n1)
+            PAYLOAD=$(find "$D"  -iname 'payload.bin'                             | head -n1)
+            SUPER=$(find "$D"    -iname 'super*.img'                              | head -n1)
+            SYSDAT=$(find "$D"   -iname 'system.new.dat'                          | head -n1)
+            IMG=$(find "$D"      -iname '*.img'                                   | head -n1)
+            NZIP=$(find "$D"     -iname '*.zip'                                   | head -n1)
+
+            if   [ -n "$HW"      ]; then DETECTED_FILE="$HW";                    DETECTED_TYPE="Huawei UPDATE.APP"
+            elif [ -n "$KDZ"     ]; then DETECTED_FILE="$KDZ";                   DETECTED_TYPE="LG KDZ"
+            elif [ -n "$OZIP"    ]; then DETECTED_FILE="$OZIP";                  DETECTED_TYPE="Oppo OZIP"
+            elif [ -n "$SIN"     ]; then DETECTED_FILE="$SIN";                   DETECTED_TYPE="Sony SIN"
+            elif [ -n "$SAM_AP"  ]; then DETECTED_FILE="$SAM_AP";                DETECTED_TYPE="Samsung AP tar"
+            elif [ -n "$SAM_ANY" ]; then DETECTED_FILE="$SAM_ANY";               DETECTED_TYPE="Samsung tar"
+            elif [ -n "$PAC"     ]; then DETECTED_FILE="$PAC";                   DETECTED_TYPE="Unisoc PAC"
+            elif [ -n "$QFIL"    ]; then DETECTED_FILE="$(dirname "$QFIL")";     DETECTED_TYPE="QFIL package dir"
+            elif [ -n "$PAYLOAD" ]; then DETECTED_FILE="$DL_FILE";               DETECTED_TYPE="OTA zip (payload.bin)"
+            elif [ -n "$SUPER"   ]; then DETECTED_FILE="$SUPER";                 DETECTED_TYPE="super.img"
+            elif [ -n "$SYSDAT"  ]; then DETECTED_FILE="$(dirname "$SYSDAT")";   DETECTED_TYPE="system.new.dat dir"
+            elif [ -n "$IMG"     ]; then DETECTED_FILE="$IMG";                   DETECTED_TYPE="*.img fallback"
+            fi
+
+            NESTED_ZIP="$NZIP"
+          }
+
+          # ---- is the download itself a directly-consumable firmware? --------
+          #      Check by extension (preserved when filename is kept) + MIME.
+          FIRMWARE_FILE=""
+
+          case "$DL_FILE" in
+            *.kdz|*.ozip|*.sin|*.pac|*.tar.md5)
+              FIRMWARE_FILE="$DL_FILE"
+              echo "Direct firmware format detected by extension." ;;
+          esac
+
+          if [ -z "$FIRMWARE_FILE" ]; then
+            case "$MIME" in
+              application/x-tar)
+                FIRMWARE_FILE="$DL_FILE"
+                echo "Direct tar firmware detected by MIME." ;;
+            esac
+          fi
+
+          # ---- otherwise, extract outer archive and scan --------------------
+          if [ -z "$FIRMWARE_FILE" ]; then
+            echo "Extracting outer archive…"
+            extract_archive "$DL_FILE" firmware_extracted
+            echo "Contents after extraction:"
+            find firmware_extracted -maxdepth 5 -type f | sort | head -80
+
+            detect_in_dir firmware_extracted
+            echo "First-pass detection: type='$DETECTED_TYPE'  file='$DETECTED_FILE'"
+
+            # Loop guard: if extraction was a silent no-op (cp instead of unzip),
+            # firmware_extracted contains only the original zip renamed.
+            # Detect that and force-unzip before falling into the nested-zip path.
+            if [ -z "$DETECTED_FILE" ] && [ -n "$NESTED_ZIP" ]; then
+              EXTRACTED_COUNT=$(find firmware_extracted -type f | wc -l)
+              if [ "$EXTRACTED_COUNT" -eq 1 ]; then
+                echo "Extraction was a no-op copy — force-unzipping: $NESTED_ZIP"
+                mkdir -p firmware_extracted_force
+                unzip -o "$NESTED_ZIP" -d firmware_extracted_force
+                echo "Contents after force-unzip:"
+                find firmware_extracted_force -maxdepth 5 -type f | sort | head -80
+                detect_in_dir firmware_extracted_force
+                echo "Force-unzip detection: type='$DETECTED_TYPE'  file='$DETECTED_FILE'"
+                # Consumed — skip the generic nested-zip pass below
+                [ -n "$DETECTED_FILE" ] && NESTED_ZIP=""
+              fi
+            fi
+
+            # Nested zip (e.g. Pixel factory image-*.zip wrapping partition images)
+            if [ -z "$DETECTED_FILE" ] && [ -n "$NESTED_ZIP" ]; then
+              echo "No firmware found; extracting nested zip: $NESTED_ZIP"
+              extract_archive "$NESTED_ZIP" firmware_extracted_inner
+              echo "Contents after nested extraction:"
+              find firmware_extracted_inner -maxdepth 5 -type f | sort | head -80
+              detect_in_dir firmware_extracted_inner
+              echo "Second-pass detection: type='$DETECTED_TYPE'  file='$DETECTED_FILE'"
+            fi
+
+            if [ -z "$DETECTED_FILE" ]; then
+              echo "ERROR: no recognizable firmware artifact found. Full listing:"
+              find firmware_extracted -type f | sort
+              exit 1
+            fi
+
+            FIRMWARE_FILE="$DETECTED_FILE"
+          fi
+
+          echo "FIRMWARE_FILE=$FIRMWARE_FILE" >> "$GITHUB_ENV"
+          echo "Firmware type : $DETECTED_TYPE"
+          echo "Firmware path : $FIRMWARE_FILE"
+          ls -lh "$FIRMWARE_FILE" 2>/dev/null || echo "(directory — passed as-is to cli.py)"
+
+      - name: Build GSI
+        run: |
+          TYPE_ARG=""
+          if [ -n "${{ github.event.inputs.rom_type }}" ]; then
+            TYPE_ARG="--type ${{ github.event.inputs.rom_type }}"
+          fi
+          .venv/bin/python cli.py build "${{ github.event.inputs.build_name }}" \
+            "$FIRMWARE_FILE" $TYPE_ARG
+
+      - name: Compress output with xz -9e
+        run: |
+          OUT_DIR="out/${{ github.event.inputs.build_name }}"
+          ls -lh "$OUT_DIR"
+          find "$OUT_DIR" -maxdepth 1 -iname '*.img' -print0 \
+            | while IFS= read -r -d '' f; do
+                echo "Compressing: $f"
+                xz -9e -T0 -v "$f"
+                XZ="${f}.xz"
+                SIZE=$(stat -c%s "$XZ")
+                # GitHub release asset hard limit: 2 147 483 648 bytes (2 GiB).
+                # Split at 1.9 GiB to stay clear of the ceiling.
+                if [ "$SIZE" -gt 1900000000 ]; then
+                  echo "Asset is $(( SIZE / 1048576 )) MiB — splitting into 1.9 GiB chunks"
+                  split -b 1900M "$XZ" "${XZ}."
+                  rm "$XZ"
+                  ls -lh "${XZ}."*
+                else
+                  echo "Asset is $(( SIZE / 1048576 )) MiB — no split needed"
+                fi
+              done
+          ls -lh "$OUT_DIR"
+
+      - name: Prepare release tag
+        id: tag
+        run: |
+          echo "tag=gsi-${{ github.event.inputs.build_name }}-$(date +%Y%m%d%H%M%S)" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ github.event.inputs.build_name }}
+          body: |
+            To reassemble split parts (*.xz.aa, *.xz.ab, …):
+            ```
+            cat *.xz.* > system.img.xz && xz -d system.img.xz
+            ```
+            Single-file releases need no reassembly.
+          files: |
+            out/${{ github.event.inputs.build_name }}/*.xz*
+            out/${{ github.event.inputs.build_name }}/*.txt
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
