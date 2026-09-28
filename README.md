@@ -1,4 +1,4 @@
-# MysticGSI
+# MysticGSI Tool
 
 A tool to build a GSI (Generic System Image) from stock Android firmware.
 
