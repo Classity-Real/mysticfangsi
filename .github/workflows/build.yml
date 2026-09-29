@@ -15,6 +15,14 @@ on:
         description: 'ROM patch set (--type), leave empty for generic'
         required: false
         default: ''
+      rom_name:
+        description: 'ROM name shown in Telegram post (e.g. XOS, OneUI, MIUI)'
+        required: true
+        default: ''
+      telegram_photo_url:
+        description: 'Photo URL for Telegram post header (optional)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -66,11 +74,6 @@ jobs:
           chmod +x setup_host.py
           python3 setup_host.py
 
-      # ---------------------------------------------------------------------------
-      # Download — preserve original filename so extension-based detection works.
-      # Google Drive / Mega keep their server-side names automatically.
-      # Direct links: aria2c without -o to preserve the URL filename.
-      # ---------------------------------------------------------------------------
       - name: Download firmware
         run: |
           URL="${{ github.event.inputs.firmware_url }}"
@@ -93,28 +96,12 @@ jobs:
               ;;
             *)
               echo "Source: direct link"
-              # No -o: preserves the server filename (.kdz, .ozip, .pac, etc.)
               aria2c -d dl -x4 -s4 "$URL"
               ;;
           esac
           echo "Downloaded:"
           find dl -maxdepth 1 -type f -exec ls -lh {} \;
 
-      # ---------------------------------------------------------------------------
-      # Locate firmware file for cli.py.
-      #
-      # Supported by MysticGSI (passed straight through):
-      #   Huawei UPDATE.APP · LG .kdz · Oppo .ozip · Sony .sin
-      #   Samsung .tar / .tar.md5 · Unisoc .pac · QFIL dir (rawprogram*.xml)
-      #   OTA zip (payload.bin inside) · super*.img · system.new.dat dir · *.img
-      #
-      # Strategy:
-      #   1. If the downloaded file is already a directly-consumable firmware
-      #      format, use it as-is (avoids unnecessary extraction).
-      #   2. Otherwise extract the outer archive and scan the contents.
-      #   3. If no firmware is found after one extraction level, look for a
-      #      nested zip (e.g. Pixel factory image-*.zip) and scan again.
-      # ---------------------------------------------------------------------------
       - name: Locate firmware file for CLI
         run: |
           DL_FILE=$(find dl -maxdepth 1 -type f | head -n1)
@@ -127,16 +114,12 @@ jobs:
           MIME=$(file -b --mime-type "$DL_FILE")
           echo "MIME: $MIME"
 
-          # ---- helpers -------------------------------------------------------
-
           extract_archive() {
             local src="$1" dst="$2"
             mkdir -p "$dst"
             local m
             m=$(file -b --mime-type "$src")
             case "$m" in
-              # JAR / APK / OTA zips all share the ZIP format; `file` often
-              # returns application/java-archive for Android OTA packages.
               application/zip|\
               application/java-archive|\
               application/x-zip-compressed|\
@@ -155,7 +138,6 @@ jobs:
               application/x-bzip2|application/x-xz)
                 tar -xf "$src" -C "$dst" ;;
               *)
-                # Extension-based second guess (MIME may be generic octet-stream)
                 case "${src##*.}" in
                   zip|apk|jar) unzip -o "$src" -d "$dst" ;;
                   7z)          7z x "$src" -o"$dst" ;;
@@ -163,7 +145,6 @@ jobs:
                                  || 7z x "$src" -o"$dst" ;;
                   tar|tgz|gz|bz2|xz) tar -xf "$src" -C "$dst" ;;
                   *)
-                    # Last resort: test zip magic regardless of label
                     if unzip -t "$src" >/dev/null 2>&1; then
                       unzip -o "$src" -d "$dst"
                     else
@@ -173,7 +154,6 @@ jobs:
             esac
           }
 
-          # Sets DETECTED_FILE and DETECTED_TYPE (globals, same shell)
           detect_in_dir() {
             local D="$1"
             DETECTED_FILE=""
@@ -212,8 +192,6 @@ jobs:
             NESTED_ZIP="$NZIP"
           }
 
-          # ---- is the download itself a directly-consumable firmware? --------
-          #      Check by extension (preserved when filename is kept) + MIME.
           FIRMWARE_FILE=""
 
           case "$DL_FILE" in
@@ -230,7 +208,6 @@ jobs:
             esac
           fi
 
-          # ---- otherwise, extract outer archive and scan --------------------
           if [ -z "$FIRMWARE_FILE" ]; then
             echo "Extracting outer archive…"
             extract_archive "$DL_FILE" firmware_extracted
@@ -240,9 +217,6 @@ jobs:
             detect_in_dir firmware_extracted
             echo "First-pass detection: type='$DETECTED_TYPE'  file='$DETECTED_FILE'"
 
-            # Loop guard: if extraction was a silent no-op (cp instead of unzip),
-            # firmware_extracted contains only the original zip renamed.
-            # Detect that and force-unzip before falling into the nested-zip path.
             if [ -z "$DETECTED_FILE" ] && [ -n "$NESTED_ZIP" ]; then
               EXTRACTED_COUNT=$(find firmware_extracted -type f | wc -l)
               if [ "$EXTRACTED_COUNT" -eq 1 ]; then
@@ -253,12 +227,10 @@ jobs:
                 find firmware_extracted_force -maxdepth 5 -type f | sort | head -80
                 detect_in_dir firmware_extracted_force
                 echo "Force-unzip detection: type='$DETECTED_TYPE'  file='$DETECTED_FILE'"
-                # Consumed — skip the generic nested-zip pass below
                 [ -n "$DETECTED_FILE" ] && NESTED_ZIP=""
               fi
             fi
 
-            # Nested zip (e.g. Pixel factory image-*.zip wrapping partition images)
             if [ -z "$DETECTED_FILE" ] && [ -n "$NESTED_ZIP" ]; then
               echo "No firmware found; extracting nested zip: $NESTED_ZIP"
               extract_archive "$NESTED_ZIP" firmware_extracted_inner
@@ -301,8 +273,6 @@ jobs:
                 xz -9e -T0 -v "$f"
                 XZ="${f}.xz"
                 SIZE=$(stat -c%s "$XZ")
-                # GitHub release asset hard limit: 2 147 483 648 bytes (2 GiB).
-                # Split at 1.9 GiB to stay clear of the ceiling.
                 if [ "$SIZE" -gt 1900000000 ]; then
                   echo "Asset is $(( SIZE / 1048576 )) MiB — splitting into 1.9 GiB chunks"
                   split -b 1900M "$XZ" "${XZ}."
@@ -321,6 +291,7 @@ jobs:
             >> "$GITHUB_OUTPUT"
 
       - name: Publish release
+        id: release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
@@ -337,3 +308,66 @@ jobs:
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify Telegram
+        if: success()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          OUT_DIR="out/${{ github.event.inputs.build_name }}"
+          OUTPUT_TXT="$OUT_DIR/output.txt"
+
+          # --- parse device name from output.txt ---
+          DEVICE_NAME=""
+          if [ -f "$OUTPUT_TXT" ]; then
+            DEVICE_NAME=$(grep -i "^Device name:" "$OUTPUT_TXT" 2>/dev/null \
+              | head -n1 | cut -d: -f2- | xargs 2>/dev/null || true)
+            if [ -z "$DEVICE_NAME" ]; then
+              BRAND=$(grep -i "^Device brand:" "$OUTPUT_TXT" | head -n1 | cut -d: -f2- | xargs || true)
+              MODEL=$(grep -i "^Device model:" "$OUTPUT_TXT" | head -n1 | cut -d: -f2- | xargs || true)
+              DEVICE_NAME="${BRAND} ${MODEL}"
+            fi
+          fi
+          [ -z "$DEVICE_NAME" ] && DEVICE_NAME="${{ github.event.inputs.build_name }}"
+
+          # --- read output.txt (cap at 700 chars to stay inside 1024 caption limit) ---
+          OUTPUT_CONTENT=""
+          [ -f "$OUTPUT_TXT" ] && OUTPUT_CONTENT=$(head -c 700 "$OUTPUT_TXT")
+
+          # --- release URL ---
+          RELEASE_URL="${{ steps.release.outputs.url }}"
+          [ -z "$RELEASE_URL" ] && \
+            RELEASE_URL="https://github.com/${{ github.repository }}/releases"
+
+          ROM_NAME="${{ github.event.inputs.rom_name }}"
+          PHOTO_URL="${{ github.event.inputs.telegram_photo_url }}"
+
+          # --- build caption ---
+          CAPTION="<b>MysticFGSI: Fan Generic System Images</b>
+          <b>Ported From:</b> ${DEVICE_NAME}
+          <b>ROM:</b> ${ROM_NAME}
+
+          <code>${OUTPUT_CONTENT}</code>
+
+          <b>Download:</b> <a href=\"${RELEASE_URL}\">GitHub</a>"
+
+          # --- send ---
+          if [ -n "$PHOTO_URL" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${CHAT_ID}\",
+                \"photo\": \"${PHOTO_URL}\",
+                \"caption\": $(echo "$CAPTION" | jq -Rs .),
+                \"parse_mode\": \"HTML\"
+              }"
+          else
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${CHAT_ID}\",
+                \"text\": $(echo "$CAPTION" | jq -Rs .),
+                \"parse_mode\": \"HTML\"
+              }"
+          fi
