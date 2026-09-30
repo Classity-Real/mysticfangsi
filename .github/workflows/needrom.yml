@@ -1,0 +1,146 @@
+name: Test Needrom Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_url:
+        description: 'Needrom ROM page URL to test'
+        required: true
+        default: 'https://needrom.com/download/xiaomi-redmi-note-10-pro/'
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Install dependencies
+        run: pip install -q requests beautifulsoup4 lxml
+
+      - name: Test Needrom login and link resolution
+        env:
+          NEEDROM_USER: ${{ secrets.NEEDROM_USER }}
+          NEEDROM_PASS: ${{ secrets.NEEDROM_PASS }}
+        run: |
+          python3 - <<'PYEOF'
+          import sys, re, os, requests
+          from bs4 import BeautifulSoup
+
+          url    = "${{ github.event.inputs.test_url }}"
+          user   = os.environ.get("NEEDROM_USER", "")
+          passwd = os.environ.get("NEEDROM_PASS", "")
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": (
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0 Safari/537.36"
+              ),
+              "Referer": "https://needrom.com/",
+          })
+
+          # --- login ---
+          if user and passwd:
+              print(f"[1/4] Logging in as: {user}")
+              lp = session.get("https://needrom.com/wp-login.php", timeout=30)
+              lp.raise_for_status()
+              lsoup = BeautifulSoup(lp.text, "lxml")
+
+              payload = {
+                  "log":         user,
+                  "pwd":         passwd,
+                  "wp-submit":   "Log In",
+                  "redirect_to": "https://needrom.com/wp-admin/",
+                  "testcookie":  "1",
+              }
+              for inp in lsoup.select("form#loginform input[type=hidden]"):
+                  payload.setdefault(inp.get("name", ""), inp.get("value", ""))
+
+              lr = session.post(
+                  "https://needrom.com/wp-login.php",
+                  data=payload,
+                  headers={"Referer": "https://needrom.com/wp-login.php"},
+                  timeout=30,
+                  allow_redirects=True,
+              )
+              lr.raise_for_status()
+
+              logged_in = any(
+                  c.name.startswith("wordpress_logged_in")
+                  for c in session.cookies
+              )
+              if logged_in:
+                  print("[1/4] Login: OK")
+              else:
+                  print("[1/4] Login: WARNING — wordpress_logged_in cookie not found")
+                  print("      Cookies:", [c.name for c in session.cookies])
+          else:
+              print("[1/4] No credentials in secrets — skipping login")
+
+          # --- fetch ROM page ---
+          print(f"[2/4] Fetching: {url}")
+          r = session.get(url, timeout=30, allow_redirects=True)
+          r.raise_for_status()
+          print(f"[2/4] Status: {r.status_code}  Final URL: {r.url}")
+
+          if "wp-login.php" in r.url or BeautifulSoup(r.text, "lxml").select_one("form#loginform"):
+              print("FAIL: redirected to login wall — credentials invalid or account locked")
+              sys.exit(1)
+
+          soup = BeautifulSoup(r.text, "lxml")
+
+          # --- extract link ---
+          print("[3/4] Scanning for download link…")
+          link = None
+
+          for sel in [
+              "a.download-link",
+              "a[href*='/download/'][class*='download']",
+              "a.btn-download",
+              "#download-link",
+          ]:
+              tag = soup.select_one(sel)
+              if tag and tag.get("href"):
+                  link = tag["href"]
+                  print(f"[3/4] Found via selector '{sel}': {link}")
+                  break
+
+          if not link:
+              for tag in soup.find_all(attrs={"data-href": True}):
+                  h = tag["data-href"]
+                  if h and re.search(r'\.(zip|rar|7z|tar|tgz|gz|xz|kdz|ozip|pac)($|\?)', h, re.I):
+                      link = h
+                      print(f"[3/4] Found via data-href: {link}")
+                      break
+
+          if not link:
+              known = re.compile(
+                  r'(mediafire\.com|mega\.nz|mega\.co\.nz|drive\.google\.com'
+                  r'|sourceforge\.net|androidfilehost\.com|dropbox\.com'
+                  r'|terabox\.com|onedrive\.live\.com)',
+                  re.I,
+              )
+              for a in soup.find_all("a", href=True):
+                  if known.search(a["href"]):
+                      link = a["href"]
+                      print(f"[3/4] Found via host pattern: {link}")
+                      break
+
+          if not link:
+              print("FAIL: no download link found on page")
+              print("--- page snippet (first 3000 chars) ---")
+              print(r.text[:3000])
+              sys.exit(1)
+
+          # --- resolve needrom redirect ---
+          print("[4/4] Resolving final URL…")
+          if link.startswith("/"):
+              link = "https://needrom.com" + link
+          if "needrom.com" in link:
+              r2 = session.get(link, timeout=30, allow_redirects=True)
+              link = r2.url
+
+          print(f"[4/4] Resolved download URL: {link}")
+          print("")
+          print("=== RESULT: OK ===")
+          PYEOF
