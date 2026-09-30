@@ -22,26 +22,54 @@ jobs:
           NEEDROM_PASS: ${{ secrets.NEEDROM_PASS }}
         run: |
           python3 - <<'PYEOF'
-          import sys, re, os, requests
+          import sys, re, os, time, requests
           from bs4 import BeautifulSoup
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
 
           url    = "${{ github.event.inputs.test_url }}"
           user   = os.environ.get("NEEDROM_USER", "")
           passwd = os.environ.get("NEEDROM_PASS", "")
 
           session = requests.Session()
+
+          # retry adapter — 3 attempts, backoff on 500/502/503/504
+          retry = Retry(
+              total=3,
+              backoff_factor=2,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=["GET", "POST"],
+          )
+          adapter = HTTPAdapter(max_retries=retry)
+          session.mount("https://", adapter)
+          session.mount("http://",  adapter)
+
           session.headers.update({
-              "User-Agent": (
-                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/124.0 Safari/537.36"
-              ),
-              "Referer": "https://needrom.com/",
+              "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                 "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                 "Chrome/124.0.0.0 Safari/537.36",
+              "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "Accept-Language": "en-US,en;q=0.5",
+              "Accept-Encoding": "gzip, deflate, br",
+              "Connection":      "keep-alive",
+              "Upgrade-Insecure-Requests": "1",
           })
+
+          # --- warm up the session with a homepage hit first ---
+          print("[0/4] Warming up connection…")
+          try:
+              hw = session.get("https://needrom.com/", timeout=30)
+              hw.raise_for_status()
+              print(f"[0/4] Homepage: {hw.status_code}")
+          except Exception as e:
+              print(f"[0/4] Homepage warm-up failed: {e} — continuing anyway")
+
+          time.sleep(1)
 
           # --- login ---
           if user and passwd:
               print(f"[1/4] Logging in as: {user}")
+
               lp = session.get("https://needrom.com/wp-login.php", timeout=30)
               lp.raise_for_status()
               lsoup = BeautifulSoup(lp.text, "lxml")
@@ -56,10 +84,16 @@ jobs:
               for inp in lsoup.select("form#loginform input[type=hidden]"):
                   payload.setdefault(inp.get("name", ""), inp.get("value", ""))
 
+              time.sleep(1)
+
               lr = session.post(
                   "https://needrom.com/wp-login.php",
                   data=payload,
-                  headers={"Referer": "https://needrom.com/wp-login.php"},
+                  headers={
+                      "Referer":       "https://needrom.com/wp-login.php",
+                      "Origin":        "https://needrom.com",
+                      "Content-Type":  "application/x-www-form-urlencoded",
+                  },
                   timeout=30,
                   allow_redirects=True,
               )
@@ -75,19 +109,26 @@ jobs:
                   print("[1/4] Login: WARNING — wordpress_logged_in cookie not found")
                   print("      Cookies:", [c.name for c in session.cookies])
           else:
-              print("[1/4] No credentials in secrets — skipping login")
+              print("[1/4] No credentials — skipping login")
+
+          time.sleep(1)
 
           # --- fetch ROM page ---
           print(f"[2/4] Fetching: {url}")
-          r = session.get(url, timeout=30, allow_redirects=True)
+          r = session.get(
+              url,
+              timeout=30,
+              allow_redirects=True,
+              headers={"Referer": "https://needrom.com/"},
+          )
           r.raise_for_status()
           print(f"[2/4] Status: {r.status_code}  Final URL: {r.url}")
 
-          if "wp-login.php" in r.url or BeautifulSoup(r.text, "lxml").select_one("form#loginform"):
-              print("FAIL: redirected to login wall — credentials invalid or account locked")
-              sys.exit(1)
-
           soup = BeautifulSoup(r.text, "lxml")
+
+          if "wp-login.php" in r.url or soup.select_one("form#loginform"):
+              print("FAIL: login wall — credentials invalid or account locked")
+              sys.exit(1)
 
           # --- extract link ---
           print("[3/4] Scanning for download link…")
@@ -127,7 +168,7 @@ jobs:
                       break
 
           if not link:
-              print("FAIL: no download link found on page")
+              print("FAIL: no download link found")
               print("--- page snippet (first 3000 chars) ---")
               print(r.text[:3000])
               sys.exit(1)
@@ -144,3 +185,4 @@ jobs:
           print("")
           print("=== RESULT: OK ===")
           PYEOF
+
