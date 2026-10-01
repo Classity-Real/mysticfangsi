@@ -120,29 +120,19 @@ jobs:
             local m
             m=$(file -b --mime-type "$src")
             case "$m" in
-              application/zip|\
-              application/java-archive|\
-              application/x-zip-compressed|\
-              application/x-zip)
+              application/zip|application/java-archive|application/x-zip-compressed|application/x-zip)
                 unzip -o "$src" -d "$dst" ;;
               application/x-7z-compressed)
                 7z x "$src" -o"$dst" ;;
               application/x-rar*|application/vnd.rar)
-                if command -v unrar >/dev/null 2>&1; then
-                  unrar x -o+ "$src" "$dst"/
-                else
-                  unrar-free x "$src" "$dst"/ 2>/dev/null \
-                    || 7z x "$src" -o"$dst"
-                fi ;;
-              application/x-tar|application/gzip|\
-              application/x-bzip2|application/x-xz)
+                unrar-free x "$src" "$dst"/ 2>/dev/null || 7z x "$src" -o"$dst" ;;
+              application/x-tar|application/gzip|application/x-bzip2|application/x-xz)
                 tar -xf "$src" -C "$dst" ;;
               *)
                 case "${src##*.}" in
                   zip|apk|jar) unzip -o "$src" -d "$dst" ;;
                   7z)          7z x "$src" -o"$dst" ;;
-                  rar)         unrar-free x "$src" "$dst"/ 2>/dev/null \
-                                 || 7z x "$src" -o"$dst" ;;
+                  rar)         unrar-free x "$src" "$dst"/ 2>/dev/null || 7z x "$src" -o"$dst" ;;
                   tar|tgz|gz|bz2|xz) tar -xf "$src" -C "$dst" ;;
                   *)
                     if unzip -t "$src" >/dev/null 2>&1; then
@@ -160,57 +150,40 @@ jobs:
             DETECTED_TYPE=""
             NESTED_ZIP=""
 
-            local HW KDZ OZIP SIN SAM_AP SAM_ANY PAC QFIL PAYLOAD \
-                  SUPER SYSDAT IMGZIP SYSIMG IMG NZIP
-            HW=$(find "$D"       -iname 'UPDATE.APP'                              | head -n1)
-            KDZ=$(find "$D"      -iname '*.kdz'                                   | head -n1)
-            OZIP=$(find "$D"     -iname '*.ozip'                                  | head -n1)
-            SIN=$(find "$D"      -iname '*.sin'                                   | head -n1)
-            SAM_AP=$(find "$D" \( -iname 'AP_*.tar.md5' -o -iname 'AP_*.tar' \)  | head -n1)
-            SAM_ANY=$(find "$D" \( -iname '*.tar.md5'   -o -iname '*.tar'    \)  | head -n1)
-            PAC=$(find "$D"      -iname '*.pac'                                   | head -n1)
-            QFIL=$(find "$D"     -iname 'rawprogram*.xml'                         | head -n1)
-            PAYLOAD=$(find "$D"  -iname 'payload.bin'                             | head -n1)
-            SUPER=$(find "$D"    -iname 'super*.img'                              | head -n1)
-            SYSDAT=$(find "$D"   -iname 'system.new.dat'                          | head -n1)
+            local HW KDZ OZIP SIN SAM_AP SAM_ANY PAC QFIL PAYLOAD SUPER SYSDAT IMGZIP SYSIMG IMG NZIP
+            HW=$(find "$D"       -iname 'UPDATE.APP'                             | head -n1)
+            KDZ=$(find "$D"      -iname '*.kdz'                                  | head -n1)
+            OZIP=$(find "$D"     -iname '*.ozip'                                 | head -n1)
+            SIN=$(find "$D"      -iname '*.sin'                                  | head -n1)
+            SAM_AP=$(find "$D" \( -iname 'AP_*.tar.md5' -o -iname 'AP_*.tar' \) | head -n1)
+            SAM_ANY=$(find "$D" \( -iname '*.tar.md5'   -o -iname '*.tar'    \) | head -n1)
+            PAC=$(find "$D"      -iname '*.pac'                                  | head -n1)
+            QFIL=$(find "$D"     -iname 'rawprogram*.xml'                        | head -n1)
+            PAYLOAD=$(find "$D"  -iname 'payload.bin'                            | head -n1)
+            SUPER=$(find "$D"    -iname 'super*.img'                             | head -n1)
+            SYSDAT=$(find "$D"   -iname 'system.new.dat'                         | head -n1)
 
-            # Google factory: image-<build>.zip contains system.img + friends.
-            # Must be checked BEFORE the generic .img fallback, otherwise we
-            # pick up bootloader-*.img sitting next to it.
             IMGZIP=$(find "$D" \( -iname 'image-*.zip' -o -iname '*-image-*.zip' \) | head -n1)
-
-            # Prefer a real system.img before any other .img.
-            SYSIMG=$(find "$D" \( -iname 'system.img' -o -iname 'system_a.img' \
-                    -o -iname 'system_b.img' -o -iname 'system-*.img' \) | head -n1)
-
-            # Generic .img, minus the bootloader/modem/vbmeta noise that lives
-            # alongside system.img in factory packages.
-            IMG=$(find "$D" -iname '*.img' \
-                  ! -iname 'bootloader*.img' ! -iname 'vbmeta*.img' \
-                  ! -iname 'dtbo*.img'       ! -iname 'dtb*.img' \
-                  ! -iname 'modem*.img'      ! -iname 'radio*.img' \
-                  | head -n1)
-
+            SYSIMG=$(find "$D" \( -iname 'system.img' -o -iname 'system_a.img' -o -iname 'system_b.img' -o -iname 'system-*.img' \) | head -n1)
+            IMG=$(find "$D" -iname '*.img' ! -iname 'bootloader*.img' ! -iname 'vbmeta*.img' ! -iname 'dtbo*.img' ! -iname 'dtb*.img' ! -iname 'modem*.img' ! -iname 'radio*.img' | head -n1)
             NZIP=$(find "$D" -iname '*.zip' | head -n1)
 
-            if   [ -n "$HW"      ]; then DETECTED_FILE="$HW";                    DETECTED_TYPE="Huawei UPDATE.APP"
-            elif [ -n "$KDZ"     ]; then DETECTED_FILE="$KDZ";                   DETECTED_TYPE="LG KDZ"
-            elif [ -n "$OZIP"    ]; then DETECTED_FILE="$OZIP";                  DETECTED_TYPE="Oppo OZIP"
-            elif [ -n "$SIN"     ]; then DETECTED_FILE="$SIN";                   DETECTED_TYPE="Sony SIN"
-            elif [ -n "$SAM_AP"  ]; then DETECTED_FILE="$SAM_AP";                DETECTED_TYPE="Samsung AP tar"
-            elif [ -n "$SAM_ANY" ]; then DETECTED_FILE="$SAM_ANY";               DETECTED_TYPE="Samsung tar"
-            elif [ -n "$PAC"     ]; then DETECTED_FILE="$PAC";                   DETECTED_TYPE="Unisoc PAC"
-            elif [ -n "$QFIL"    ]; then DETECTED_FILE="$(dirname "$QFIL")";     DETECTED_TYPE="QFIL package dir"
-            elif [ -n "$PAYLOAD" ]; then DETECTED_FILE="$DL_FILE";               DETECTED_TYPE="OTA zip (payload.bin)"
-            elif [ -n "$SUPER"   ]; then DETECTED_FILE="$SUPER";                 DETECTED_TYPE="super.img"
-            elif [ -n "$SYSDAT"  ]; then DETECTED_FILE="$(dirname "$SYSDAT")";   DETECTED_TYPE="system.new.dat dir"
-            elif [ -n "$SYSIMG"  ]; then DETECTED_FILE="$SYSIMG";                DETECTED_TYPE="system.img"
-            elif [ -n "$IMGZIP"  ]; then DETECTED_FILE="";                       DETECTED_TYPE="nested image-*.zip"
-            elif [ -n "$IMG"     ]; then DETECTED_FILE="$IMG";                   DETECTED_TYPE="*.img fallback"
+            if   [ -n "$HW"      ]; then DETECTED_FILE="$HW";                  DETECTED_TYPE="Huawei UPDATE.APP"
+            elif [ -n "$KDZ"     ]; then DETECTED_FILE="$KDZ";                 DETECTED_TYPE="LG KDZ"
+            elif [ -n "$OZIP"    ]; then DETECTED_FILE="$OZIP";                DETECTED_TYPE="Oppo OZIP"
+            elif [ -n "$SIN"     ]; then DETECTED_FILE="$SIN";                 DETECTED_TYPE="Sony SIN"
+            elif [ -n "$SAM_AP"  ]; then DETECTED_FILE="$SAM_AP";              DETECTED_TYPE="Samsung AP tar"
+            elif [ -n "$SAM_ANY" ]; then DETECTED_FILE="$SAM_ANY";             DETECTED_TYPE="Samsung tar"
+            elif [ -n "$PAC"     ]; then DETECTED_FILE="$PAC";                 DETECTED_TYPE="Unisoc PAC"
+            elif [ -n "$QFIL"    ]; then DETECTED_FILE="$(dirname "$QFIL")";   DETECTED_TYPE="QFIL package dir"
+            elif [ -n "$PAYLOAD" ]; then DETECTED_FILE="$DL_FILE";             DETECTED_TYPE="OTA zip (payload.bin)"
+            elif [ -n "$SUPER"   ]; then DETECTED_FILE="$SUPER";               DETECTED_TYPE="super.img"
+            elif [ -n "$SYSDAT"  ]; then DETECTED_FILE="$(dirname "$SYSDAT")"; DETECTED_TYPE="system.new.dat dir"
+            elif [ -n "$SYSIMG"  ]; then DETECTED_FILE="$SYSIMG";              DETECTED_TYPE="system.img"
+            elif [ -n "$IMGZIP"  ]; then DETECTED_FILE="";                     DETECTED_TYPE="nested image-*.zip"
+            elif [ -n "$IMG"     ]; then DETECTED_FILE="$IMG";                 DETECTED_TYPE="*.img fallback"
             fi
 
-            # Prefer the Google inner zip over any bare *.zip when we need to
-            # recurse — image-*.zip is what actually holds system.img.
             if [ -n "$IMGZIP" ]; then
               NESTED_ZIP="$IMGZIP"
             else
@@ -235,7 +208,7 @@ jobs:
           fi
 
           if [ -z "$FIRMWARE_FILE" ]; then
-            echo "Extracting outer archive…"
+            echo "Extracting outer archive..."
             extract_archive "$DL_FILE" firmware_extracted
             echo "Contents after extraction:"
             find firmware_extracted -maxdepth 5 -type f | sort | head -80
@@ -246,7 +219,7 @@ jobs:
             if [ -z "$DETECTED_FILE" ] && [ -n "$NESTED_ZIP" ]; then
               EXTRACTED_COUNT=$(find firmware_extracted -type f | wc -l)
               if [ "$EXTRACTED_COUNT" -eq 1 ]; then
-                echo "Extraction was a no-op copy — force-unzipping: $NESTED_ZIP"
+                echo "Extraction was a no-op copy - force-unzipping: $NESTED_ZIP"
                 mkdir -p firmware_extracted_force
                 unzip -o "$NESTED_ZIP" -d firmware_extracted_force
                 echo "Contents after force-unzip:"
@@ -278,7 +251,7 @@ jobs:
           echo "FIRMWARE_FILE=$FIRMWARE_FILE" >> "$GITHUB_ENV"
           echo "Firmware type : $DETECTED_TYPE"
           echo "Firmware path : $FIRMWARE_FILE"
-          ls -lh "$FIRMWARE_FILE" 2>/dev/null || echo "(directory — passed as-is to cli.py)"
+          ls -lh "$FIRMWARE_FILE" 2>/dev/null || echo "(directory - passed as-is to cli.py)"
 
       - name: Build GSI
         run: |
@@ -300,12 +273,12 @@ jobs:
                 XZ="${f}.xz"
                 SIZE=$(stat -c%s "$XZ")
                 if [ "$SIZE" -gt 1900000000 ]; then
-                  echo "Asset is $(( SIZE / 1048576 )) MiB — splitting into 1.9 GiB chunks"
+                  echo "Asset is $(( SIZE / 1048576 )) MiB - splitting into 1.9 GiB chunks"
                   split -b 1900M "$XZ" "${XZ}."
                   rm "$XZ"
                   ls -lh "${XZ}."*
                 else
-                  echo "Asset is $(( SIZE / 1048576 )) MiB — no split needed"
+                  echo "Asset is $(( SIZE / 1048576 )) MiB - no split needed"
                 fi
               done
           ls -lh "$OUT_DIR"
@@ -323,14 +296,14 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ github.event.inputs.build_name }}
           body: |
-            To reassemble split parts (*.xz.aa, *.xz.ab, …):
+            To reassemble split parts (*.xz.aa, *.xz.ab, ...):
             ```
             cat *.xz.* > system.img.xz && xz -d system.img.xz
             ```
             Single-file releases need no reassembly.
-          files:. |
-            out/${{ github.event.inputstele.build_name }}/*.xz*
-            outgram/${{ github.event.inputs.build_name }}_/*.txt
+          files: |
+            out/${{ github.event.inputs.build_name }}/*.xz*
+            out/${{ github.event.inputs.build_name }}/*.txt
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -364,7 +337,7 @@ jobs:
             RELEASE_URL="https://github.com/${{ github.repository }}/releases"
 
           ROM_NAME="${{ github.event.inputs.rom_name }}"
-          PHOTO_URL="${{ github.event.inputsphoto_url }}"
+          PHOTO_URL="${{ github.event.inputs.telegram_photo_url }}"
 
           CAPTION="<b>MysticFGSI: Fan Generic System Images</b>
           <b>Ported From:</b> ${DEVICE_NAME}
