@@ -160,7 +160,7 @@ jobs:
             PAC=$(find "$D"      -iname '*.pac'                                  | head -n1)
             QFIL=$(find "$D"     -iname 'rawprogram*.xml'                        | head -n1)
             PAYLOAD=$(find "$D"  -iname 'payload.bin'                            | head -n1)
-            SUPER=$(find "$D"    -iname 'super*.img'                             | head -n1)
+            SUPER=$(find "$D"    -iname 'super*.img' ! -iname 'super_empty*.img' | head -n1)
             SYSDAT=$(find "$D"   -iname 'system.new.dat'                         | head -n1)
 
             IMGZIP=$(find "$D" \( -iname 'image-*.zip' -o -iname '*-image-*.zip' \) | head -n1)
