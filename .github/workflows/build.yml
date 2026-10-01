@@ -1,4 +1,4 @@
-name: MysticGSI Build
+name: MysticFGSI Build
 
 on:
   workflow_dispatch:
