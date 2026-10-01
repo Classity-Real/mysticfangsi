@@ -151,17 +151,17 @@ jobs:
             NESTED_ZIP=""
 
             local HW KDZ OZIP SIN SAM_AP SAM_ANY PAC QFIL PAYLOAD SUPER SYSDAT IMGZIP SYSIMG IMG NZIP
-            HW=$(find "$D"       -iname 'UPDATE.APP'                             | head -n1)
-            KDZ=$(find "$D"      -iname '*.kdz'                                  | head -n1)
-            OZIP=$(find "$D"     -iname '*.ozip'                                 | head -n1)
-            SIN=$(find "$D"      -iname '*.sin'                                  | head -n1)
-            SAM_AP=$(find "$D" \( -iname 'AP_*.tar.md5' -o -iname 'AP_*.tar' \) | head -n1)
-            SAM_ANY=$(find "$D" \( -iname '*.tar.md5'   -o -iname '*.tar'    \) | head -n1)
-            PAC=$(find "$D"      -iname '*.pac'                                  | head -n1)
-            QFIL=$(find "$D"     -iname 'rawprogram*.xml'                        | head -n1)
-            PAYLOAD=$(find "$D"  -iname 'payload.bin'                            | head -n1)
-            SUPER=$(find "$D"    -iname 'super*.img' ! -iname 'super_empty*.img' | head -n1)
-            SYSDAT=$(find "$D"   -iname 'system.new.dat'                         | head -n1)
+            HW=$(find "$D"       -iname 'UPDATE.APP'                              | head -n1)
+            KDZ=$(find "$D"      -iname '*.kdz'                                   | head -n1)
+            OZIP=$(find "$D"     -iname '*.ozip'                                  | head -n1)
+            SIN=$(find "$D"      -iname '*.sin'                                   | head -n1)
+            SAM_AP=$(find "$D" \( -iname 'AP_*.tar.md5' -o -iname 'AP_*.tar' \)   | head -n1)
+            SAM_ANY=$(find "$D" \( -iname '*.tar.md5'   -o -iname '*.tar'    \)   | head -n1)
+            PAC=$(find "$D"      -iname '*.pac'                                   | head -n1)
+            QFIL=$(find "$D"     -iname 'rawprogram*.xml'                         | head -n1)
+            PAYLOAD=$(find "$D"  -iname 'payload.bin'                             | head -n1)
+            SUPER=$(find "$D"    -iname 'super*.img' ! -iname 'super_empty*.img'  | head -n1)
+            SYSDAT=$(find "$D"   -iname 'system.new.dat'                          | head -n1)
 
             IMGZIP=$(find "$D" \( -iname 'image-*.zip' -o -iname '*-image-*.zip' \) | head -n1)
             SYSIMG=$(find "$D" \( -iname 'system.img' -o -iname 'system_a.img' -o -iname 'system_b.img' -o -iname 'system-*.img' \) | head -n1)
@@ -187,21 +187,24 @@ jobs:
             elif [ -n "$SUPER"   ]; then DETECTED_FILE="$SUPER";               DETECTED_TYPE="super.img"
             elif [ -n "$SYSDAT"  ]; then DETECTED_FILE="$(dirname "$SYSDAT")"; DETECTED_TYPE="system.new.dat dir"
             elif [ -n "$SYSIMG"  ]; then
-              # If sibling partition images exist, cli.py needs a *file* that
-              # contains them all. Search upward for the image-*.zip container.
-              SIB=$(find "$(dirname "$SYSIMG")" -maxdepth 1 -type f \
-                    \( -iname 'vendor*.img' -o -iname 'product*.img' -o -iname 'odm*.img' \) | wc -l)
-              if [ "$SIB" -gt 0 ]; then
-                ZIP_UP=$(find "$(dirname "$(dirname "$SYSIMG")")" -maxdepth 3 \
-                         -iname 'image-*.zip' 2>/dev/null | head -n1)
-                [ -z "$ZIP_UP" ] && [ -n "$NESTED_ZIP" ] && ZIP_UP="$NESTED_ZIP"
-                if [ -n "$ZIP_UP" ]; then
-                  DETECTED_FILE="$ZIP_UP"
-                  DETECTED_TYPE="split-partition zip"
-                else
-                  DETECTED_FILE="$SYSIMG"
-                  DETECTED_TYPE="system.img (no container found)"
+              SIB_DIR=$(dirname "$SYSIMG")
+              HAS_SIB=$(find "$SIB_DIR" -maxdepth 1 -type f \
+                        \( -iname 'product*.img' -o -iname 'vendor*.img' -o -iname 'odm*.img' \) \
+                        -print -quit 2>/dev/null)
+              ZIP_UP=""
+              if [ -n "$HAS_SIB" ]; then
+                P1=$(dirname "$SIB_DIR")
+                P2=$(dirname "$P1")
+                ZIP_UP=$(find "$P2" -maxdepth 2 -iname 'image-*.zip' -print -quit 2>/dev/null)
+                if [ -z "$ZIP_UP" ]; then
+                  if [ -n "$NESTED_ZIP" ]; then
+                    ZIP_UP="$NESTED_ZIP"
+                  fi
                 fi
+              fi
+              if [ -n "$ZIP_UP" ]; then
+                DETECTED_FILE="$ZIP_UP"
+                DETECTED_TYPE="split-partition zip"
               else
                 DETECTED_FILE="$SYSIMG"
                 DETECTED_TYPE="system.img"
@@ -371,9 +374,9 @@ jobs:
             curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
               -H "Content-Type: application/json" \
               -d "{
-                \"chat_id\": \"${CH itAT_ID}\",
+                \"chat_id\": \"${CHAT_ID}\",
                 \"photo\": \"${PHOTO_URL}\",
- reports                \"caption\": $(echo "$CAPTION" | jq -Rs .),
+                \"caption\": $(echo "$CAPTION" | jq -Rs .),
                 \"parse_mode\": \"HTML\"
               }"
           else
