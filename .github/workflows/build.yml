@@ -1,4 +1,4 @@
-name: MysticFGSI Build
+name: MysticGSI Build
 
 on:
   workflow_dispatch:
@@ -165,8 +165,15 @@ jobs:
 
             IMGZIP=$(find "$D" \( -iname 'image-*.zip' -o -iname '*-image-*.zip' \) | head -n1)
             SYSIMG=$(find "$D" \( -iname 'system.img' -o -iname 'system_a.img' -o -iname 'system_b.img' -o -iname 'system-*.img' \) | head -n1)
-            IMG=$(find "$D" -iname '*.img' ! -iname 'bootloader*.img' ! -iname 'vbmeta*.img' ! -iname 'dtbo*.img' ! -iname 'dtb*.img' ! -iname 'modem*.img' ! -iname 'radio*.img' | head -n1)
+            IMG=$(find "$D" -iname '*.img' ! -iname 'bootloader*.img' ! -iname 'vbmeta*.img' ! -iname 'dtbo*.img' ! -iname 'dtb*.img' ! -iname 'modem*.img' ! -iname 'radio*.img' ! -iname 'super_empty*.img' | head -n1)
             NZIP=$(find "$D" -iname '*.zip' | head -n1)
+
+            # Resolve NESTED_ZIP up front so later branches can reference it.
+            if [ -n "$IMGZIP" ]; then
+              NESTED_ZIP="$IMGZIP"
+            else
+              NESTED_ZIP="$NZIP"
+            fi
 
             if   [ -n "$HW"      ]; then DETECTED_FILE="$HW";                  DETECTED_TYPE="Huawei UPDATE.APP"
             elif [ -n "$KDZ"     ]; then DETECTED_FILE="$KDZ";                 DETECTED_TYPE="LG KDZ"
@@ -180,22 +187,19 @@ jobs:
             elif [ -n "$SUPER"   ]; then DETECTED_FILE="$SUPER";               DETECTED_TYPE="super.img"
             elif [ -n "$SYSDAT"  ]; then DETECTED_FILE="$(dirname "$SYSDAT")"; DETECTED_TYPE="system.new.dat dir"
             elif [ -n "$SYSIMG"  ]; then
-            SIB=$(find "$(dirname "$SYSIMG")" -maxdepth 1 -type f \( -iname 'vendor*.img' -o -iname 'product*.img' -o -iname 'odm*.img' \) | wc -l)
-            if [ "$SIB" -gt 0 ]; then
-            DETECTED_FILE="$(dirname "$SYSIMG")"
-            DETECTED_TYPE="split-partition dir"
-            else
-              DETECTED_FILE="$SYSIMG"
-              DETECTED_TYPE="system.img"
-            fi
+              # If sibling partition images exist, cli.py needs the container
+              # (the inner image-*.zip), not the extracted folder — it wants a file.
+              SIB=$(find "$(dirname "$SYSIMG")" -maxdepth 1 -type f \
+                    \( -iname 'vendor*.img' -o -iname 'product*.img' -o -iname 'odm*.img' \) | wc -l)
+              if [ "$SIB" -gt 0 ] && [ -n "$NESTED_ZIP" ]; then
+                DETECTED_FILE="$NESTED_ZIP"
+                DETECTED_TYPE="split-partition zip"
+              else
+                DETECTED_FILE="$SYSIMG"
+                DETECTED_TYPE="system.img"
+              fi
             elif [ -n "$IMGZIP"  ]; then DETECTED_FILE="";                     DETECTED_TYPE="nested image-*.zip"
             elif [ -n "$IMG"     ]; then DETECTED_FILE="$IMG";                 DETECTED_TYPE="*.img fallback"
-            fi
-
-            if [ -n "$IMGZIP" ]; then
-              NESTED_ZIP="$IMGZIP"
-            else
-              NESTED_ZIP="$NZIP"
             fi
           }
 
