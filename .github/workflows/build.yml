@@ -179,7 +179,15 @@ jobs:
             elif [ -n "$PAYLOAD" ]; then DETECTED_FILE="$DL_FILE";             DETECTED_TYPE="OTA zip (payload.bin)"
             elif [ -n "$SUPER"   ]; then DETECTED_FILE="$SUPER";               DETECTED_TYPE="super.img"
             elif [ -n "$SYSDAT"  ]; then DETECTED_FILE="$(dirname "$SYSDAT")"; DETECTED_TYPE="system.new.dat dir"
-            elif [ -n "$SYSIMG"  ]; then DETECTED_FILE="$SYSIMG";              DETECTED_TYPE="system.img"
+            elif [ -n "$SYSIMG"  ]; then
+            SIB=$(find "$(dirname "$SYSIMG")" -maxdepth 1 -type f \( -iname 'vendor*.img' -o -iname 'product*.img' -o -iname 'odm*.img' \) | wc -l)
+            if [ "$SIB" -gt 0 ]; then
+            DETECTED_FILE="$(dirname "$SYSIMG")"
+            DETECTED_TYPE="split-partition dir"
+            else
+              DETECTED_FILE="$SYSIMG"
+              DETECTED_TYPE="system.img"
+            fi
             elif [ -n "$IMGZIP"  ]; then DETECTED_FILE="";                     DETECTED_TYPE="nested image-*.zip"
             elif [ -n "$IMG"     ]; then DETECTED_FILE="$IMG";                 DETECTED_TYPE="*.img fallback"
             fi
