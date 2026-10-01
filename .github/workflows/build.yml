@@ -141,7 +141,7 @@ jobs:
                 case "${src##*.}" in
                   zip|apk|jar) unzip -o "$src" -d "$dst" ;;
                   7z)          7z x "$src" -o"$dst" ;;
-                  rar)         unrar x -o+ "$src" "$dst"/ 2>/dev/null \
+                  rar)         unrar-free x "$src" "$dst"/ 2>/dev/null \
                                  || 7z x "$src" -o"$dst" ;;
                   tar|tgz|gz|bz2|xz) tar -xf "$src" -C "$dst" ;;
                   *)
@@ -160,7 +160,8 @@ jobs:
             DETECTED_TYPE=""
             NESTED_ZIP=""
 
-            local HW KDZ OZIP SIN SAM_AP SAM_ANY PAC QFIL PAYLOAD SUPER SYSDAT IMG NZIP
+            local HW KDZ OZIP SIN SAM_AP SAM_ANY PAC QFIL PAYLOAD \
+                  SUPER SYSDAT IMGZIP SYSIMG IMG NZIP
             HW=$(find "$D"       -iname 'UPDATE.APP'                              | head -n1)
             KDZ=$(find "$D"      -iname '*.kdz'                                   | head -n1)
             OZIP=$(find "$D"     -iname '*.ozip'                                  | head -n1)
@@ -172,8 +173,25 @@ jobs:
             PAYLOAD=$(find "$D"  -iname 'payload.bin'                             | head -n1)
             SUPER=$(find "$D"    -iname 'super*.img'                              | head -n1)
             SYSDAT=$(find "$D"   -iname 'system.new.dat'                          | head -n1)
-            IMG=$(find "$D"      -iname '*.img'                                   | head -n1)
-            NZIP=$(find "$D"     -iname '*.zip'                                   | head -n1)
+
+            # Google factory: image-<build>.zip contains system.img + friends.
+            # Must be checked BEFORE the generic .img fallback, otherwise we
+            # pick up bootloader-*.img sitting next to it.
+            IMGZIP=$(find "$D" \( -iname 'image-*.zip' -o -iname '*-image-*.zip' \) | head -n1)
+
+            # Prefer a real system.img before any other .img.
+            SYSIMG=$(find "$D" \( -iname 'system.img' -o -iname 'system_a.img' \
+                    -o -iname 'system_b.img' -o -iname 'system-*.img' \) | head -n1)
+
+            # Generic .img, minus the bootloader/modem/vbmeta noise that lives
+            # alongside system.img in factory packages.
+            IMG=$(find "$D" -iname '*.img' \
+                  ! -iname 'bootloader*.img' ! -iname 'vbmeta*.img' \
+                  ! -iname 'dtbo*.img'       ! -iname 'dtb*.img' \
+                  ! -iname 'modem*.img'      ! -iname 'radio*.img' \
+                  | head -n1)
+
+            NZIP=$(find "$D" -iname '*.zip' | head -n1)
 
             if   [ -n "$HW"      ]; then DETECTED_FILE="$HW";                    DETECTED_TYPE="Huawei UPDATE.APP"
             elif [ -n "$KDZ"     ]; then DETECTED_FILE="$KDZ";                   DETECTED_TYPE="LG KDZ"
@@ -186,10 +204,18 @@ jobs:
             elif [ -n "$PAYLOAD" ]; then DETECTED_FILE="$DL_FILE";               DETECTED_TYPE="OTA zip (payload.bin)"
             elif [ -n "$SUPER"   ]; then DETECTED_FILE="$SUPER";                 DETECTED_TYPE="super.img"
             elif [ -n "$SYSDAT"  ]; then DETECTED_FILE="$(dirname "$SYSDAT")";   DETECTED_TYPE="system.new.dat dir"
+            elif [ -n "$SYSIMG"  ]; then DETECTED_FILE="$SYSIMG";                DETECTED_TYPE="system.img"
+            elif [ -n "$IMGZIP"  ]; then DETECTED_FILE="";                       DETECTED_TYPE="nested image-*.zip"
             elif [ -n "$IMG"     ]; then DETECTED_FILE="$IMG";                   DETECTED_TYPE="*.img fallback"
             fi
 
-            NESTED_ZIP="$NZIP"
+            # Prefer the Google inner zip over any bare *.zip when we need to
+            # recurse — image-*.zip is what actually holds system.img.
+            if [ -n "$IMGZIP" ]; then
+              NESTED_ZIP="$IMGZIP"
+            else
+              NESTED_ZIP="$NZIP"
+            fi
           }
 
           FIRMWARE_FILE=""
@@ -302,9 +328,9 @@ jobs:
             cat *.xz.* > system.img.xz && xz -d system.img.xz
             ```
             Single-file releases need no reassembly.
-          files: |
-            out/${{ github.event.inputs.build_name }}/*.xz*
-            out/${{ github.event.inputs.build_name }}/*.txt
+          files:. |
+            out/${{ github.event.inputstele.build_name }}/*.xz*
+            outgram/${{ github.event.inputs.build_name }}_/*.txt
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -318,7 +344,6 @@ jobs:
           OUT_DIR="out/${{ github.event.inputs.build_name }}"
           OUTPUT_TXT="$OUT_DIR/output.txt"
 
-          # --- parse device name from output.txt ---
           DEVICE_NAME=""
           if [ -f "$OUTPUT_TXT" ]; then
             DEVICE_NAME=$(grep -i "^Device name:" "$OUTPUT_TXT" 2>/dev/null \
@@ -331,19 +356,16 @@ jobs:
           fi
           [ -z "$DEVICE_NAME" ] && DEVICE_NAME="${{ github.event.inputs.build_name }}"
 
-          # --- read output.txt (cap at 700 chars to stay inside 1024 caption limit) ---
           OUTPUT_CONTENT=""
           [ -f "$OUTPUT_TXT" ] && OUTPUT_CONTENT=$(head -c 700 "$OUTPUT_TXT")
 
-          # --- release URL ---
           RELEASE_URL="${{ steps.release.outputs.url }}"
           [ -z "$RELEASE_URL" ] && \
             RELEASE_URL="https://github.com/${{ github.repository }}/releases"
 
           ROM_NAME="${{ github.event.inputs.rom_name }}"
-          PHOTO_URL="${{ github.event.inputs.telegram_photo_url }}"
+          PHOTO_URL="${{ github.event.inputsphoto_url }}"
 
-          # --- build caption ---
           CAPTION="<b>MysticFGSI: Fan Generic System Images</b>
           <b>Ported From:</b> ${DEVICE_NAME}
           <b>ROM:</b> ${ROM_NAME}
@@ -352,7 +374,6 @@ jobs:
 
           <b>Download:</b> <a href=\"${RELEASE_URL}\">GitHub</a>"
 
-          # --- send ---
           if [ -n "$PHOTO_URL" ]; then
             curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
               -H "Content-Type: application/json" \
