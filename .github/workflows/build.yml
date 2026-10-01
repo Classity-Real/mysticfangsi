@@ -187,13 +187,21 @@ jobs:
             elif [ -n "$SUPER"   ]; then DETECTED_FILE="$SUPER";               DETECTED_TYPE="super.img"
             elif [ -n "$SYSDAT"  ]; then DETECTED_FILE="$(dirname "$SYSDAT")"; DETECTED_TYPE="system.new.dat dir"
             elif [ -n "$SYSIMG"  ]; then
-              # If sibling partition images exist, cli.py needs the container
-              # (the inner image-*.zip), not the extracted folder — it wants a file.
+              # If sibling partition images exist, cli.py needs a *file* that
+              # contains them all. Search upward for the image-*.zip container.
               SIB=$(find "$(dirname "$SYSIMG")" -maxdepth 1 -type f \
                     \( -iname 'vendor*.img' -o -iname 'product*.img' -o -iname 'odm*.img' \) | wc -l)
-              if [ "$SIB" -gt 0 ] && [ -n "$NESTED_ZIP" ]; then
-                DETECTED_FILE="$NESTED_ZIP"
-                DETECTED_TYPE="split-partition zip"
+              if [ "$SIB" -gt 0 ]; then
+                ZIP_UP=$(find "$(dirname "$(dirname "$SYSIMG")")" -maxdepth 3 \
+                         -iname 'image-*.zip' 2>/dev/null | head -n1)
+                [ -z "$ZIP_UP" ] && [ -n "$NESTED_ZIP" ] && ZIP_UP="$NESTED_ZIP"
+                if [ -n "$ZIP_UP" ]; then
+                  DETECTED_FILE="$ZIP_UP"
+                  DETECTED_TYPE="split-partition zip"
+                else
+                  DETECTED_FILE="$SYSIMG"
+                  DETECTED_TYPE="system.img (no container found)"
+                fi
               else
                 DETECTED_FILE="$SYSIMG"
                 DETECTED_TYPE="system.img"
@@ -363,9 +371,9 @@ jobs:
             curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
               -H "Content-Type: application/json" \
               -d "{
-                \"chat_id\": \"${CHAT_ID}\",
+                \"chat_id\": \"${CH itAT_ID}\",
                 \"photo\": \"${PHOTO_URL}\",
-                \"caption\": $(echo "$CAPTION" | jq -Rs .),
+ reports                \"caption\": $(echo "$CAPTION" | jq -Rs .),
                 \"parse_mode\": \"HTML\"
               }"
           else
