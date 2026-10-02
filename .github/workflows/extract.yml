@@ -1,0 +1,321 @@
+name: "Extract ROM Partition"
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "URL to ROM file"
+        required: true
+        type: string
+      rom_type:
+        description: "ROM format"
+        required: true
+        type: choice
+        default: "fastboot"
+        options:
+          - "fastboot"   # Xiaomi/standard .tgz containing *.img files (incl. super.img)
+          - "ota"        # OTA .zip containing payload.bin (logical partitions dumped directly)
+          - "direct"     # Direct .img download (rom_url IS the partition)
+          - "super"      # URL points at a super.img; extract a logical partition from it
+      partition:
+        description: "Partition to extract (boot, vendor_boot, dtbo, init_boot, super, system, vendor, product, ...)"
+        required: true
+        default: "boot"
+        type: string
+      output_name:
+        description: "Optional output filename (default: <partition>.img)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  extract:
+    name: "Extract ${{ inputs.partition }}"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Free disk space"
+        run: |
+          echo "Before:"
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          sudo rm -rf /usr/local/share/powershell /usr/local/share/chromium
+          sudo rm -rf /usr/local/lib/node_modules /opt/az "$AGENT_TOOLSDIRECTORY"
+          echo "After:"
+          df -h /
+
+      - name: "Install tools"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y aria2 unzip tar file xxd build-essential git
+
+          if [ "${{ inputs.rom_type }}" = "ota" ]; then
+            echo "Installing payload-dumper-go..."
+            URL=$(curl -sL https://api.github.com/repos/ssut/payload-dumper-go/releases/latest \
+              | grep "browser_download_url.*linux_amd64.tar.gz" \
+              | cut -d '"' -f 4 | head -n 1)
+            echo "URL: $URL"
+            curl -sL -o pdg.tar.gz "$URL"
+            tar -xzf pdg.tar.gz
+            sudo mv payload-dumper-go /usr/local/bin/
+            rm -f pdg.tar.gz
+            payload-dumper-go --version || true
+          fi
+
+          # lpunpack is needed whenever the user might extract a logical partition
+          # from a super.img — either in fastboot mode (if their requested
+          # partition isn't standalone in the ROM) or in the dedicated super mode.
+          if [ "${{ inputs.rom_type }}" = "fastboot" ] || [ "${{ inputs.rom_type }}" = "super" ]; then
+            echo "Installing lpunpack..."
+
+            # Try the prebuilt binary first (fast, no compile).
+            curl -fLsS -o /tmp/lpunpack \
+              "https://github.com/LonelyFool/lpunpack_and_lpmake/releases/download/0.1.0/lpunpack" || true
+
+            if [ -f /tmp/lpunpack ]; then
+              chmod +x /tmp/lpunpack
+              if /tmp/lpunpack --help >/dev/null 2>&1 || /tmp/lpunpack 2>&1 | grep -qi usage; then
+                sudo mv /tmp/lpunpack /usr/local/bin/lpunpack
+                echo "lpunpack (prebuilt) installed"
+              else
+                echo "Prebuilt lpunpack won't run on this runner, compiling from source..."
+                rm -f /tmp/lpunpack
+              fi
+            fi
+
+            if ! command -v lpunpack >/dev/null 2>&1; then
+              git clone --depth=1 https://github.com/LonelyFool/lpunpack_and_lpmake.git /tmp/lpmake-src
+              cd /tmp/lpmake-src
+              make -j$(nproc)
+
+              BIN=$(find /tmp/lpmake-src -type f -name lpunpack -executable | head -n 1)
+              if [ -z "$BIN" ]; then
+                echo "::error::lpunpack build failed"
+                ls -R /tmp/lpmake-src | head -n 60
+                exit 1
+              fi
+
+              sudo cp "$BIN" /usr/local/bin/lpunpack
+              cd ${{ github.workspace }}
+              echo "lpunpack (compiled) installed"
+            fi
+
+            lpunpack 2>&1 | head -n 5 || true
+          fi
+
+      - name: "Download ROM"
+        run: |
+          mkdir -p work && cd work
+
+          URL="${{ inputs.rom_url }}"
+          FILENAME=$(basename "${URL%%\?*}")
+          [ -z "$FILENAME" ] && FILENAME="downloaded.bin"
+
+          echo "Downloading: $URL"
+          echo "Saving as:   $FILENAME"
+          aria2c -x 16 -s 16 --console-log-level=warn -o "$FILENAME" "$URL"
+
+          echo "ROM_FILENAME=$FILENAME" >> $GITHUB_ENV
+          ls -lh
+
+      - name: "Extract fastboot ROM (.tgz)"
+        if: inputs.rom_type == 'fastboot'
+        working-directory: work
+        run: |
+          echo "Extracting fastboot ROM archive..."
+          tar -xzf "${{ env.ROM_FILENAME }}"
+
+          echo "── .img files found in ROM ──"
+          find . -name "*.img" -exec ls -lh {} \; | sort
+
+      - name: "Extract OTA ROM (payload.bin)"
+        if: inputs.rom_type == 'ota'
+        working-directory: work
+        run: |
+          echo "Extracting payload.bin from OTA zip..."
+          unzip -q "${{ env.ROM_FILENAME }}" "payload.bin" -d payload-dir
+
+          if [ ! -f payload-dir/payload.bin ]; then
+            echo "::error::payload.bin not found in the OTA zip"
+            unzip -l "${{ env.ROM_FILENAME }}" | head -n 40
+            exit 1
+          fi
+
+          echo "Dumping partitions from payload.bin..."
+          payload-dumper-go -o dumped payload-dir/payload.bin
+
+          echo "── .img files dumped ──"
+          find dumped -name "*.img" -exec ls -lh {} \; | sort
+
+      - name: "Prepare direct / super image"
+        if: inputs.rom_type == 'direct' || inputs.rom_type == 'super'
+        working-directory: work
+        run: |
+          echo "Mode: ${{ inputs.rom_type }} — the downloaded file is used directly."
+          file "${{ env.ROM_FILENAME }}"
+          ls -lh
+
+          # Sanity check the magic bytes so the user gets an early error if the
+          # URL was wrong. super.img uses "0x53 0xEF 0x... " magic in its
+          # primary metadata header; the very first sector is usually zeros or
+          # an LP_METADATA_GEOMETRY_HEADER.
+          if [ "${{ inputs.rom_type }}" = "super" ]; then
+            echo "── First 64 bytes (magic check) ──"
+            xxd "${{ env.ROM_FILENAME }}" | head -n 4
+
+            SIZE=$(stat -c%s "${{ env.ROM_FILENAME }}")
+            if [ "$SIZE" -lt 1048576 ]; then
+              echo "::warning::Downloaded file is only $SIZE bytes — this doesn't look like a super.img"
+            fi
+          fi
+
+      - name: "Extract logical partition from super.img (super mode)"
+        if: inputs.rom_type == 'super'
+        working-directory: work
+        run: |
+          PARTITION="${{ inputs.partition }}"
+          PARTITION="${PARTITION%.img}"
+
+          if [ "$PARTITION" = "super" ]; then
+            echo "::error::You asked to extract 'super' from a super.img — that's the input, not a logical partition."
+            echo "Pick one of: system, system_ext, product, vendor, odm, vendor_dlkm, system_dlkm, odm_dlkm"
+            exit 1
+          fi
+
+          mkdir -p super-extract
+          echo "Running lpunpack on ${{ env.ROM_FILENAME }}..."
+          lpunpack "${{ env.ROM_FILENAME }}" super-extract/ || {
+            echo "::error::lpunpack failed — the file may not be a valid super.img"
+            exit 1
+          }
+
+          echo "── Logical partitions extracted ──"
+          find super-extract -name "*.img" -exec ls -lh {} \; | sort
+
+      - name: "Locate partition"
+        working-directory: work
+        run: |
+          PARTITION="${{ inputs.partition }}"
+          PARTITION="${PARTITION%.img}"
+          echo "Looking for partition: ${PARTITION}.img"
+
+          IMG_PATH=""
+
+          case "${{ inputs.rom_type }}" in
+            fastboot)
+              # First try a standalone file (works for boot, vendor_boot, dtbo,
+              # init_boot, vbmeta, and also for `super` itself — super.img is
+              # shipped as a standalone file in fastboot ROMs).
+              IMG_PATH=$(find . -type f -name "${PARTITION}.img" | head -n 1)
+
+              # If not found, and the user asked for a logical partition, try
+              # unpacking it from super.img.
+              if [ -z "$IMG_PATH" ] || [ ! -f "$IMG_PATH" ]; then
+                case "$PARTITION" in
+                  system|system_ext|product|vendor|odm|vendor_dlkm|system_dlkm|odm_dlkm)
+                    SUPER_IMG=$(find . -type f -name "super.img" | head -n 1)
+                    if [ -n "$SUPER_IMG" ]; then
+                      echo "Partition '$PARTITION' is not standalone — extracting from super.img"
+                      mkdir -p super-extract
+                      lpunpack "$SUPER_IMG" super-extract/ || true
+                      IMG_PATH=$(find super-extract -type f -name "${PARTITION}.img" | head -n 1)
+                    else
+                      echo "::warning::No super.img found in the fastboot ROM — cannot extract '$PARTITION'"
+                    fi
+                    ;;
+                esac
+              fi
+              ;;
+
+            ota)
+              # payload.bin contains the logical partitions directly — super.img
+              # is not present as a standalone file in OTA ROMs.
+              if [ "$PARTITION" = "super" ]; then
+                echo "::error::'super' does not exist as a file in an OTA payload."
+                echo "In OTA mode, logical partitions (system, vendor, product, ...) are dumped individually."
+                echo "Re-run with partition=<logical partition> instead."
+                echo ""
+                echo "── Available partitions in payload ──"
+                find dumped -type f -name "*.img" -printf "%f\n" | sort
+                exit 1
+              fi
+              IMG_PATH=$(find dumped -type f -name "${PARTITION}.img" | head -n 1)
+              ;;
+
+            direct)
+              IMG_PATH="${{ env.ROM_FILENAME }}"
+              ;;
+
+            super)
+              IMG_PATH=$(find super-extract -type f -name "${PARTITION}.img" | head -n 1)
+              ;;
+          esac
+
+          if [ -z "$IMG_PATH" ] || [ ! -f "$IMG_PATH" ]; then
+            echo "::error::Partition '${PARTITION}' not found"
+            echo ""
+            echo "── Available partitions ──"
+            case "${{ inputs.rom_type }}" in
+              fastboot)
+                find . -type f -name "*.img" -printf "  %f\n" | sort
+                ;;
+              ota)
+                find dumped -type f -name "*.img" -printf "  %f\n" | sort
+                ;;
+              super)
+                find super-extract -type f -name "*.img" -printf "  %f\n" | sort
+                ;;
+            esac
+            exit 1
+          fi
+
+          echo "Found: $IMG_PATH"
+          ls -lh "$IMG_PATH"
+
+          OUT_NAME="${{ inputs.output_name }}"
+          [ -z "$OUT_NAME" ] && OUT_NAME="${PARTITION}.img"
+
+          cp "$IMG_PATH" "../$OUT_NAME"
+
+          echo "OUTPUT_FILE=$OUT_NAME"                 >> $GITHUB_ENV
+          echo "OUTPUT_PATH=$(realpath ../$OUT_NAME)" >> $GITHUB_ENV
+
+      - name: "Verify extracted partition"
+        run: |
+          echo "── Extracted partition ──"
+          ls -lh "${{ env.OUTPUT_PATH }}"
+          file "${{ env.OUTPUT_PATH }}"
+
+          echo ""
+          echo "── First 32 bytes (magic) ──"
+          xxd "${{ env.OUTPUT_PATH }}" | head -n 2
+
+          echo ""
+          echo "── SHA256 ──"
+          sha256sum "${{ env.OUTPUT_PATH }}" | tee "${{ env.OUTPUT_PATH }}.sha256"
+
+      - name: "Upload partition artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUTPUT_FILE }}
+          path: |
+            ${{ env.OUTPUT_PATH }}
+            ${{ env.OUTPUT_PATH }}.sha256
+          retention-days: 30
+
+      - name: "Summary"
+        run: |
+          {
+            echo "## Extraction Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| ROM URL | \`${{ inputs.rom_url }}\` |"
+            echo "| ROM type | \`${{ inputs.rom_type }}\` |"
+            echo "| Partition | \`${{ inputs.partition }}\` |"
+            echo "| Output file | \`${{ env.OUTPUT_FILE }}\` |"
+            echo "| Size | \`$(du -h "${{ env.OUTPUT_PATH }}" | cut -f1)\` |"
+            echo "| SHA256 | \`$(cut -d' ' -f1 "${{ env.OUTPUT_PATH }}.sha256")\` |"
+            echo ""
+            echo "Download the artifact named **${{ env.OUTPUT_FILE }}** from this run."
+          } >> $GITHUB_STEP_SUMMARY
