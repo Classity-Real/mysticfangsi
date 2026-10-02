@@ -2244,6 +2244,8 @@ Architecture: {self._architecture()}
 
     def _warn_cpu_features(self):
         self.cpu_warning = ""
+        if os.environ.get("MYSTIC_ISA_WARN", "0") != "1":
+            return
         system = self._get_system_root()
         found = {}
         for relative_path in (
@@ -2278,7 +2280,7 @@ Architecture: {self._architecture()}
                 "provide fallbacks."
             )
             self.log("Warning: " + self.cpu_warning)
-
+            
     def _write_image(self, output_name):
         """
         Builds out/<rom_name>/<output_name>.img from the system tree, sized
