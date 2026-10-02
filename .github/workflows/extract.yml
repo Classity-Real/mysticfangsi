@@ -11,10 +11,11 @@ on:
         description: "ROM format"
         required: true
         type: choice
-        default: "fastboot"
+        default: "xiaomi"
         options:
-          - "fastboot"   # Xiaomi/standard .tgz containing *.img files (incl. super.img)
-          - "ota"        # OTA .zip containing payload.bin (logical partitions dumped directly)
+          - "xiaomi"     # Xiaomi fastboot .tgz — download, untar, grab .img (no extra tools)
+          - "fastboot"   # Generic fastboot .tgz (with optional lpunpack for logical parts)
+          - "ota"        # OTA .zip containing payload.bin
           - "direct"     # Direct .img download (rom_url IS the partition)
           - "super"      # URL points at a super.img; extract a logical partition from it
       partition:
@@ -46,9 +47,25 @@ jobs:
 
       - name: "Install tools"
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y aria2 unzip tar file xxd build-essential git
+          # ── Xiaomi mode: absolute minimum ──
+          # Xiaomi fastboot ROMs are plain .tgz files. We only need:
+          #   aria2c → download
+          #   tar    → extract
+          #   file / xxd → verify
+          # No lpunpack, no payload-dumper-go, no build tools.
+          if [ "${{ inputs.rom_type }}" = "xiaomi" ]; then
+            echo "Xiaomi mode — installing minimal tools only"
+            sudo apt-get update -qq
+            sudo apt-get install -y aria2 tar file xxd
+            echo "Done. Skipping lpunpack / payload-dumper-go entirely."
+            exit 0
+          fi
 
+          # ── All other modes: full toolchain ──
+          sudo apt-get update -qq
+          sudo apt-get install -y aria2 unzip tar file xxd build-essential git python3
+
+          # ── payload-dumper-go (OTA mode only) ──
           if [ "${{ inputs.rom_type }}" = "ota" ]; then
             echo "Installing payload-dumper-go..."
             URL=$(curl -sL https://api.github.com/repos/ssut/payload-dumper-go/releases/latest \
@@ -62,45 +79,78 @@ jobs:
             payload-dumper-go --version || true
           fi
 
-          # lpunpack is needed whenever the user might extract a logical partition
-          # from a super.img — either in fastboot mode (if their requested
-          # partition isn't standalone in the ROM) or in the dedicated super mode.
+          # ── lpunpack (fastboot + super modes only) ──
           if [ "${{ inputs.rom_type }}" = "fastboot" ] || [ "${{ inputs.rom_type }}" = "super" ]; then
             echo "Installing lpunpack..."
 
-            # Try the prebuilt binary first (fast, no compile).
-            curl -fLsS -o /tmp/lpunpack \
-              "https://github.com/LonelyFool/lpunpack_and_lpmake/releases/download/0.1.0/lpunpack" || true
+            install_lpunpack() {
+              # --- Attempt 1: prebuilt ---
+              echo "  → Trying itsNileshHere/android-lptools prebuilt..."
+              LP_URL=$(curl -sL https://api.github.com/repos/itsNileshHere/android-lptools/releases/latest \
+                | grep "browser_download_url.*linux" \
+                | cut -d '"' -f 4 | head -n 1)
 
-            if [ -f /tmp/lpunpack ]; then
-              chmod +x /tmp/lpunpack
-              if /tmp/lpunpack --help >/dev/null 2>&1 || /tmp/lpunpack 2>&1 | grep -qi usage; then
-                sudo mv /tmp/lpunpack /usr/local/bin/lpunpack
-                echo "lpunpack (prebuilt) installed"
-              else
-                echo "Prebuilt lpunpack won't run on this runner, compiling from source..."
-                rm -f /tmp/lpunpack
-              fi
-            fi
-
-            if ! command -v lpunpack >/dev/null 2>&1; then
-              git clone --depth=1 https://github.com/LonelyFool/lpunpack_and_lpmake.git /tmp/lpmake-src
-              cd /tmp/lpmake-src
-              make -j$(nproc)
-
-              BIN=$(find /tmp/lpmake-src -type f -name lpunpack -executable | head -n 1)
-              if [ -z "$BIN" ]; then
-                echo "::error::lpunpack build failed"
-                ls -R /tmp/lpmake-src | head -n 60
-                exit 1
+              if [ -n "$LP_URL" ]; then
+                echo "    URL: $LP_URL"
+                curl -fLsS -o /tmp/lptools.tar.gz "$LP_URL" || true
+                if [ -s /tmp/lptools.tar.gz ]; then
+                  mkdir -p /tmp/lptools && tar -xzf /tmp/lptools.tar.gz -C /tmp/lptools
+                  BIN=$(find /tmp/lptools -type f -name lpunpack | head -n 1)
+                  if [ -n "$BIN" ]; then
+                    chmod +x "$BIN"
+                    if "$BIN" --help >/dev/null 2>&1 || "$BIN" 2>&1 | grep -qi usage; then
+                      sudo cp "$BIN" /usr/local/bin/lpunpack
+                      echo "    ✓ installed (prebuilt)"
+                      return 0
+                    fi
+                  fi
+                fi
               fi
 
-              sudo cp "$BIN" /usr/local/bin/lpunpack
-              cd ${{ github.workspace }}
-              echo "lpunpack (compiled) installed"
+              # --- Attempt 2: build from source ---
+              echo "  → Trying build from source (android-lptools)..."
+              rm -rf /tmp/lptools-src
+              if git clone --depth=1 https://github.com/itsNileshHere/android-lptools.git /tmp/lptools-src 2>/dev/null; then
+                cd /tmp/lptools-src
+                if [ -f "./make.sh" ]; then
+                  chmod +x ./make.sh && ./make.sh || true
+                fi
+                BIN=$(find /tmp/lptools-src -type f -name lpunpack -executable | head -n 1)
+                if [ -n "$BIN" ]; then
+                  sudo cp "$BIN" /usr/local/bin/lpunpack
+                  echo "    ✓ installed (compiled)"
+                  cd "$GITHUB_WORKSPACE"
+                  return 0
+                fi
+              fi
+
+              # --- Attempt 3: Python fallback ---
+              echo "  → Trying Python fallback (unix3dgforce/lpunpack)..."
+              rm -rf /tmp/lpunpack-py
+              if git clone --depth=1 https://github.com/unix3dgforce/lpunpack.git /tmp/lpunpack-py 2>/dev/null; then
+                if [ -f /tmp/lpunpack-py/lpunpack.py ]; then
+                  sudo tee /usr/local/bin/lpunpack > /dev/null << 'PYEOF'
+#!/usr/bin/env bash
+exec python3 /tmp/lpunpack-py/lpunpack.py "$@"
+PYEOF
+                  sudo chmod +x /usr/local/bin/lpunpack
+                  echo "    ✓ installed (Python fallback)"
+                  cd "$GITHUB_WORKSPACE"
+                  return 0
+                fi
+              fi
+
+              return 1
+            }
+
+            if ! install_lpunpack; then
+              echo "::error::All lpunpack installation attempts failed"
+              exit 1
             fi
 
-            lpunpack 2>&1 | head -n 5 || true
+            echo "── Verifying lpunpack ──"
+            command -v lpunpack
+            lpunpack --help 2>&1 | head -n 5 || true
           fi
 
       - name: "Download ROM"
@@ -118,7 +168,18 @@ jobs:
           echo "ROM_FILENAME=$FILENAME" >> $GITHUB_ENV
           ls -lh
 
-      - name: "Extract fastboot ROM (.tgz)"
+      - name: "Extract Xiaomi fastboot ROM (.tgz)"
+        if: inputs.rom_type == 'xiaomi'
+        working-directory: work
+        run: |
+          echo "Extracting Xiaomi fastboot ROM..."
+          tar -xzf "${{ env.ROM_FILENAME }}"
+
+          echo ""
+          echo "── .img files found ──"
+          find . -name "*.img" -exec ls -lh {} \; | sort
+
+      - name: "Extract generic fastboot ROM (.tgz)"
         if: inputs.rom_type == 'fastboot'
         working-directory: work
         run: |
@@ -155,10 +216,6 @@ jobs:
           file "${{ env.ROM_FILENAME }}"
           ls -lh
 
-          # Sanity check the magic bytes so the user gets an early error if the
-          # URL was wrong. super.img uses "0x53 0xEF 0x... " magic in its
-          # primary metadata header; the very first sector is usually zeros or
-          # an LP_METADATA_GEOMETRY_HEADER.
           if [ "${{ inputs.rom_type }}" = "super" ]; then
             echo "── First 64 bytes (magic check) ──"
             xxd "${{ env.ROM_FILENAME }}" | head -n 4
@@ -202,15 +259,16 @@ jobs:
           IMG_PATH=""
 
           case "${{ inputs.rom_type }}" in
-            fastboot)
-              # First try a standalone file (works for boot, vendor_boot, dtbo,
-              # init_boot, vbmeta, and also for `super` itself — super.img is
-              # shipped as a standalone file in fastboot ROMs).
+            xiaomi|fastboot)
+              # Standalone file first (boot, vendor_boot, dtbo, init_boot,
+              # vbmeta, super, etc. — all shipped as flat .img files).
               IMG_PATH=$(find . -type f -name "${PARTITION}.img" | head -n 1)
 
-              # If not found, and the user asked for a logical partition, try
-              # unpacking it from super.img.
-              if [ -z "$IMG_PATH" ] || [ ! -f "$IMG_PATH" ]; then
+              # Xiaomi mode intentionally does NOT unpack super.img — it's a
+              # "just get the flat image" mode. Only generic fastboot mode
+              # falls back to lpunpack for logical partitions.
+              if { [ -z "$IMG_PATH" ] || [ ! -f "$IMG_PATH" ]; } && \
+                 [ "${{ inputs.rom_type }}" = "fastboot" ]; then
                 case "$PARTITION" in
                   system|system_ext|product|vendor|odm|vendor_dlkm|system_dlkm|odm_dlkm)
                     SUPER_IMG=$(find . -type f -name "super.img" | head -n 1)
@@ -220,7 +278,7 @@ jobs:
                       lpunpack "$SUPER_IMG" super-extract/ || true
                       IMG_PATH=$(find super-extract -type f -name "${PARTITION}.img" | head -n 1)
                     else
-                      echo "::warning::No super.img found in the fastboot ROM — cannot extract '$PARTITION'"
+                      echo "::warning::No super.img found in the ROM — cannot extract '$PARTITION'"
                     fi
                     ;;
                 esac
@@ -228,8 +286,6 @@ jobs:
               ;;
 
             ota)
-              # payload.bin contains the logical partitions directly — super.img
-              # is not present as a standalone file in OTA ROMs.
               if [ "$PARTITION" = "super" ]; then
                 echo "::error::'super' does not exist as a file in an OTA payload."
                 echo "In OTA mode, logical partitions (system, vendor, product, ...) are dumped individually."
@@ -256,8 +312,13 @@ jobs:
             echo ""
             echo "── Available partitions ──"
             case "${{ inputs.rom_type }}" in
-              fastboot)
+              xiaomi|fastboot)
                 find . -type f -name "*.img" -printf "  %f\n" | sort
+                echo ""
+                if [ "${{ inputs.rom_type }}" = "xiaomi" ]; then
+                  echo "Note: Xiaomi mode only extracts flat .img files from the .tgz."
+                  echo "For logical partitions (system, vendor, ...), use rom_type: fastboot."
+                fi
                 ;;
               ota)
                 find dumped -type f -name "*.img" -printf "  %f\n" | sort
