@@ -49,8 +49,8 @@ jobs:
         run: |
           # ── Xiaomi mode: absolute minimum ──
           # Xiaomi fastboot ROMs are plain .tgz files. We only need:
-          #   aria2c → download
-          #   tar    → extract
+          #   aria2c     → download
+          #   tar        → extract
           #   file / xxd → verify
           # No lpunpack, no payload-dumper-go, no build tools.
           if [ "${{ inputs.rom_type }}" = "xiaomi" ]; then
@@ -129,10 +129,10 @@ jobs:
               rm -rf /tmp/lpunpack-py
               if git clone --depth=1 https://github.com/unix3dgforce/lpunpack.git /tmp/lpunpack-py 2>/dev/null; then
                 if [ -f /tmp/lpunpack-py/lpunpack.py ]; then
-                  sudo tee /usr/local/bin/lpunpack > /dev/null << 'PYEOF'
-#!/usr/bin/env bash
-exec python3 /tmp/lpunpack-py/lpunpack.py "$@"
-PYEOF
+                  {
+                    echo '#!/usr/bin/env bash'
+                    echo 'exec python3 /tmp/lpunpack-py/lpunpack.py "$@"'
+                  } | sudo tee /usr/local/bin/lpunpack > /dev/null
                   sudo chmod +x /usr/local/bin/lpunpack
                   echo "    ✓ installed (Python fallback)"
                   cd "$GITHUB_WORKSPACE"
